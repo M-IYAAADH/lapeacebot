@@ -17,6 +17,13 @@ tries receives: `Sorry you cant do that, you are not the Goat`.
 - `/blocked` — show the number of blocked stickers and packs
 - `/help` — show command help
 
+The bot remembers sticker message IDs it observes for up to 48 hours. When a
+sticker or pack is blocked, it immediately removes matching recent messages as
+well as deleting future occurrences. Telegram's Bot API does not let bots fetch
+arbitrary historical group messages, so messages sent before this tracking
+version was deployed cannot be discovered automatically; the sticker directly
+replied to is still deleted.
+
 ## 1. Create the Telegram bot
 
 1. Open `@BotFather` in Telegram.
@@ -81,9 +88,10 @@ curl "https://api.telegram.org/botYOUR_TOKEN/getWebhookInfo"
 
 ## 5. Use it
 
-In the group, reply to the unwanted sticker with `/blocksticker`. Future uses of
-that exact sticker will be deleted. Use `/blockpack` instead if every sticker
-from its pack should be deleted.
+In the group, reply to the unwanted sticker with `/blocksticker`. Recent tracked
+uses and the replied-to message will be removed, and future uses of that exact
+sticker will be deleted. Use `/blockpack` instead if every sticker from its pack
+should be deleted.
 
 ## Security notes
 

@@ -45,6 +45,9 @@ if (!Number.isSafeInteger(ownerUserId) || ownerUserId <= 0) {
 
 const redis = new Redis({ url: redisUrl, token: redisToken });
 const telegramBaseUrl = `https://api.telegram.org/bot${botToken}`;
+const HISTORY_TTL_SECONDS = 48 * 60 * 60;
+const HISTORY_WINDOW_MS = HISTORY_TTL_SECONDS * 1000;
+const MAX_TRACKED_MESSAGES = 1000;
 
 function stickerKey(chatId: number) {
   return `telegram:${chatId}:blocked-stickers`;
@@ -52,6 +55,14 @@ function stickerKey(chatId: number) {
 
 function packKey(chatId: number) {
   return `telegram:${chatId}:blocked-packs`;
+}
+
+function stickerHistoryKey(chatId: number, stickerId: string) {
+  return `telegram:${chatId}:history:sticker:${stickerId}`;
+}
+
+function packHistoryKey(chatId: number, packName: string) {
+  return `telegram:${chatId}:history:pack:${packName}`;
 }
 
 function commandFrom(text?: string): string | undefined {
@@ -79,6 +90,43 @@ async function sendMessage(chatId: number, text: string, replyTo?: number) {
     text,
     ...(replyTo ? { reply_parameters: { message_id: replyTo } } : {})
   });
+}
+
+async function rememberMessage(key: string, messageId: number) {
+  const entry = `${Date.now()}:${messageId}`;
+  const pipeline = redis.pipeline();
+  pipeline.lpush(key, entry);
+  pipeline.ltrim(key, 0, MAX_TRACKED_MESSAGES - 1);
+  pipeline.expire(key, HISTORY_TTL_SECONDS);
+  await pipeline.exec();
+}
+
+async function deleteRecentMessages(chatId: number, historyKey: string, includeId?: number) {
+  const entries = await redis.lrange<string>(historyKey, 0, -1);
+  const cutoff = Date.now() - HISTORY_WINDOW_MS;
+  const messageIds = new Set<number>();
+
+  for (const entry of entries) {
+    const [timestampText, messageIdText] = String(entry).split(":", 2);
+    const timestamp = Number(timestampText);
+    const messageId = Number(messageIdText);
+    if (Number.isFinite(timestamp) && timestamp >= cutoff && Number.isSafeInteger(messageId)) {
+      messageIds.add(messageId);
+    }
+  }
+
+  if (includeId) messageIds.add(includeId);
+  const ids = [...messageIds];
+
+  for (let index = 0; index < ids.length; index += 100) {
+    await telegram("deleteMessages", {
+      chat_id: chatId,
+      message_ids: ids.slice(index, index + 100)
+    });
+  }
+
+  await redis.del(historyKey);
+  return ids.length;
 }
 
 async function handleCommand(message: Message, command: string) {
@@ -123,7 +171,16 @@ async function handleCommand(message: Message, command: string) {
 
   if (command === "/blocksticker") {
     await redis.sadd(stickerKey(chat.id), sticker.file_unique_id);
-    await sendMessage(chat.id, "That sticker is now blocked.", messageId);
+    const deleted = await deleteRecentMessages(
+      chat.id,
+      stickerHistoryKey(chat.id, sticker.file_unique_id),
+      message.reply_to_message?.message_id
+    );
+    await sendMessage(
+      chat.id,
+      `That sticker is now blocked. Removed ${deleted} recent occurrence${deleted === 1 ? "" : "s"}.`,
+      messageId
+    );
   } else if (command === "/unblocksticker") {
     await redis.srem(stickerKey(chat.id), sticker.file_unique_id);
     await sendMessage(chat.id, "That sticker is now allowed.", messageId);
@@ -133,7 +190,16 @@ async function handleCommand(message: Message, command: string) {
       return;
     }
     await redis.sadd(packKey(chat.id), sticker.set_name);
-    await sendMessage(chat.id, "That entire sticker pack is now blocked.", messageId);
+    const deleted = await deleteRecentMessages(
+      chat.id,
+      packHistoryKey(chat.id, sticker.set_name),
+      message.reply_to_message?.message_id
+    );
+    await sendMessage(
+      chat.id,
+      `That entire sticker pack is now blocked. Removed ${deleted} recent message${deleted === 1 ? "" : "s"}.`,
+      messageId
+    );
   } else if (command === "/unblockpack") {
     if (!sticker.set_name) {
       await sendMessage(chat.id, "This sticker does not belong to a detectable sticker pack.", messageId);
@@ -179,7 +245,21 @@ async function processUpdate(update: Update) {
       chat_id: message.chat.id,
       message_id: message.message_id
     });
+    return;
   }
+
+  const historyWrites = [
+    rememberMessage(
+      stickerHistoryKey(message.chat.id, message.sticker.file_unique_id),
+      message.message_id
+    )
+  ];
+  if (message.sticker.set_name) {
+    historyWrites.push(
+      rememberMessage(packHistoryKey(message.chat.id, message.sticker.set_name), message.message_id)
+    );
+  }
+  await Promise.all(historyWrites);
 }
 
 export default async function handler(request: VercelRequest, response: VercelResponse) {
